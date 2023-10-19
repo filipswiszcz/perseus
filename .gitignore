@@ -1,0 +1,8 @@
+# Directories
+build
+
+# Compiled files
+*.o
+
+# Other
+run
