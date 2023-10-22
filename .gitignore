@@ -1,8 +1,11 @@
-# Directories
-build
-
-# Compiled files
+# Compiled class file
 *.o
 
+# Directory
+.vscode
+build
+perseus.*
+
 # Other
-run
+.DS_Store
+perseus
