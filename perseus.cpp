@@ -9,6 +9,8 @@
 #include <Metal/Metal.hpp>
 #include <MetalKit/MetalKit.hpp>
 
+#include <simd/simd.h>
+
 #pragma region Declaration {
 
     class Render {
@@ -19,12 +21,19 @@
 
             ~Render();
 
+            void buildShaders();
+
+            void buildBuffers();
+
             void draw(MTK::View* view);
 
         private:
 
             MTL::Device* _device;
             MTL::CommandQueue* _commandQueue;
+            MTL::RenderPipelineState* _pipeState;
+            MTL::Buffer* _vertexPositionsBuff;
+            MTL::Buffer* _vertexColorsBuff;
             
     };
 
@@ -160,7 +169,7 @@ int main() {
 
         CGRect frame = (CGRect) {
             {100.0, 100.0},
-            {512.0, 512.0}
+            {1024.0, 1024.0}
         };
 
         _window = NS::Window::alloc() -> init(
@@ -215,11 +224,115 @@ int main() {
 
     Render::Render(MTL::Device* device) : _device(device -> retain()) {
         _commandQueue = _device -> newCommandQueue();
+
+        buildShaders();
+        buildBuffers();
     }
 
     Render::~Render() {
+        _vertexPositionsBuff -> release();
+        _vertexColorsBuff -> release();
+        _pipeState -> release();
         _commandQueue -> release();
         _device -> release();
+    }
+
+    void Render::buildShaders() {
+
+        using NS::UTF8StringEncoding;
+
+        const char* src = R"(
+            #include <metal_stdlib>
+
+            using namespace metal;
+
+            struct v2f {
+
+                float4 position [[position]];
+                half3 color;
+
+            };
+
+            v2f vertex vertexCore(uint vertexId [[vertex_id]],
+                device const float3* positions [[buffer(0)]],
+                device const float3* colors [[buffer(1)]]) {
+
+                    v2f out;
+
+                    out.position = float4(positions[vertexId], 1.0);
+                    out.color = half3(colors[vertexId]);
+
+                    return out;
+                }
+
+            half4 fragment fragmentCore(v2f in [[stage_in]]) {
+                return half4(in.color, 1.0);
+            }
+
+        )";
+
+        NS::Error* err = nullptr;
+        MTL::Library* lib = _device -> newLibrary(NS::String::string(src, UTF8StringEncoding), nullptr, &err);
+
+        if (!lib) {
+            __builtin_printf("%s", err -> localizedDescription() -> utf8String());
+            assert(false);
+        }
+
+        MTL::Function* vFn = lib -> newFunction(NS::String::string("vertexCore", UTF8StringEncoding));
+        MTL::Function* fFn = lib -> newFunction(NS::String::string("fragmentCore", UTF8StringEncoding));
+
+        MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc() -> init();
+
+        desc -> setVertexFunction(vFn);
+        desc -> setFragmentFunction(fFn);
+        desc -> colorAttachments() -> object(0) -> setPixelFormat(MTL::PixelFormat::PixelFormatBGRA8Unorm_sRGB);
+
+        _pipeState = _device -> newRenderPipelineState(desc, &err);
+
+        if (!_pipeState) {
+            __builtin_printf("%s", err -> localizedDescription() -> utf8String());
+            assert(false);
+        }
+
+        vFn -> release();
+        fFn -> release();
+        
+        desc -> release();
+        lib -> release();
+
+    }
+
+    void Render::buildBuffers() {
+
+        const size_t numVerticles = 3;
+
+        simd::float3 positions[numVerticles] = {
+            {-0.8f, 0.8f, 0.0f},
+            {0.0f, -0.8f, 0.0f},
+            {+0.8f, 0.8f, 0.0f}
+        };
+
+        simd::float3 colors[numVerticles] = {
+            {1.0f, 0.3f, 0.2f},
+            {0.8f, 1.0, 0.0f},
+            {0.8f, 0.0f, 1.0}
+        };
+
+        const size_t positionsSize = numVerticles * sizeof(simd::float3);
+        const size_t colorsSize = numVerticles * sizeof(simd::float3);
+
+        MTL::Buffer* vPosBuff = _device -> newBuffer(positionsSize, MTL::ResourceStorageModeManaged);
+        MTL::Buffer* vColBuff = _device -> newBuffer(colorsSize, MTL::ResourceStorageModeManaged);
+
+        _vertexPositionsBuff = vPosBuff;
+        _vertexColorsBuff = vColBuff;
+
+        memcpy(_vertexPositionsBuff -> contents(), positions, positionsSize);
+        memcpy(_vertexColorsBuff -> contents(), colors, colorsSize);
+
+        _vertexPositionsBuff -> didModifyRange(NS::Range::Make(0, _vertexPositionsBuff -> length()));
+        _vertexColorsBuff -> didModifyRange(NS::Range::Make(0, _vertexColorsBuff -> length()));
     }
 
     void Render::draw(MTK::View* view) {
@@ -230,6 +343,10 @@ int main() {
         MTL::RenderPassDescriptor* passDesc = view -> currentRenderPassDescriptor();
         MTL::RenderCommandEncoder* cmdEncoder = cmdBuff -> renderCommandEncoder(passDesc);
 
+        cmdEncoder -> setRenderPipelineState(_pipeState);
+        cmdEncoder -> setVertexBuffer(_vertexPositionsBuff, 0, 0);
+        cmdEncoder -> setVertexBuffer(_vertexColorsBuff, 0, 1);
+        cmdEncoder -> drawPrimitives(MTL::PrimitiveType::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
         cmdEncoder -> endEncoding();
 
         cmdBuff -> presentDrawable(view -> currentDrawable());
