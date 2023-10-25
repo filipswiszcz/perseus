@@ -31,7 +31,9 @@
 
             MTL::Device* _device;
             MTL::CommandQueue* _commandQueue;
+            MTL::Library* _shaderLibrary;
             MTL::RenderPipelineState* _pipeState;
+            MTL::Buffer* _argBuff;
             MTL::Buffer* _vertexPositionsBuff;
             MTL::Buffer* _vertexColorsBuff;
             
@@ -183,14 +185,14 @@ int main() {
 
         _view = MTK::View::alloc() -> init(frame, _device);
         _view -> setColorPixelFormat(MTL::PixelFormat::PixelFormatBGRA8Unorm_sRGB);
-        _view -> setClearColor(MTL::ClearColor::Make(0.0, 0.0, 0.0, 0.0));
+        _view -> setClearColor(MTL::ClearColor::Make(0.0, 0.0, 0.0, 0.8));
 
         _coreViewDelegate = new CoreViewDelegate(_device);
 
         _view -> setDelegate(_coreViewDelegate);
 
         _window -> setContentView(_view);
-        _window -> setTitle(NS::String::string("Perseus", NS::StringEncoding::UTF8StringEncoding));
+        _window -> setTitle(NS::String::string("Powered by Perseus", NS::StringEncoding::UTF8StringEncoding));
         _window -> makeKeyAndOrderFront(nullptr);
 
         NS::Application* app = reinterpret_cast<NS::Application*>(notification -> object());
@@ -230,6 +232,8 @@ int main() {
     }
 
     Render::~Render() {
+        _shaderLibrary -> release();
+        _argBuff -> release();
         _vertexPositionsBuff -> release();
         _vertexColorsBuff -> release();
         _pipeState -> release();
@@ -253,14 +257,20 @@ int main() {
 
             };
 
+            struct VertexCoreData {
+
+                device float3* positions [[id(0)]];
+                device float3* colors [[id(1)]];
+
+            };
+
             v2f vertex vertexCore(uint vertexId [[vertex_id]],
-                device const float3* positions [[buffer(0)]],
-                device const float3* colors [[buffer(1)]]) {
+                device const VertexCoreData* vertexCoreData [[buffer(0)]]) {
 
                     v2f out;
 
-                    out.position = float4(positions[vertexId], 1.0);
-                    out.color = half3(colors[vertexId]);
+                    out.position = float4(vertexCoreData -> positions[vertexId], 1.0);
+                    out.color = half3(vertexCoreData -> colors[vertexId]);
 
                     return out;
                 }
@@ -299,7 +309,8 @@ int main() {
         fFn -> release();
         
         desc -> release();
-        lib -> release();
+        
+        _shaderLibrary = lib;
 
     }
 
@@ -333,6 +344,26 @@ int main() {
 
         _vertexPositionsBuff -> didModifyRange(NS::Range::Make(0, _vertexPositionsBuff -> length()));
         _vertexColorsBuff -> didModifyRange(NS::Range::Make(0, _vertexColorsBuff -> length()));
+
+        using NS::UTF8StringEncoding;
+
+        assert(_shaderLibrary);
+
+        MTL::Function* vFn = _shaderLibrary -> newFunction(NS::String::string("vertexCore", UTF8StringEncoding));
+        MTL::ArgumentEncoder* argEncoder = vFn -> newArgumentEncoder(0);
+
+        MTL::Buffer* argBuff = _device -> newBuffer(argEncoder -> encodedLength(), MTL::ResourceStorageModeManaged);
+
+        _argBuff = argBuff;
+
+        argEncoder -> setArgumentBuffer(_argBuff, 0);
+        argEncoder -> setBuffer(_vertexPositionsBuff, 0, 0);
+        argEncoder -> setBuffer(_vertexColorsBuff, 0, 1);
+
+        argBuff -> didModifyRange(NS::Range::Make(0, _argBuff -> length()));
+
+        vFn -> release();
+        argEncoder -> release();
     }
 
     void Render::draw(MTK::View* view) {
@@ -344,8 +375,9 @@ int main() {
         MTL::RenderCommandEncoder* cmdEncoder = cmdBuff -> renderCommandEncoder(passDesc);
 
         cmdEncoder -> setRenderPipelineState(_pipeState);
-        cmdEncoder -> setVertexBuffer(_vertexPositionsBuff, 0, 0);
-        cmdEncoder -> setVertexBuffer(_vertexColorsBuff, 0, 1);
+        cmdEncoder -> setVertexBuffer(_argBuff, 0, 0);
+        cmdEncoder -> useResource(_vertexPositionsBuff, MTL::ResourceUsageRead);
+        cmdEncoder -> useResource(_vertexColorsBuff, MTL::ResourceUsageRead);
         cmdEncoder -> drawPrimitives(MTL::PrimitiveType::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
         cmdEncoder -> endEncoding();
 
