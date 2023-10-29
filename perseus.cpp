@@ -25,6 +25,8 @@
 
             void buildBuffers();
 
+            void buildFrame();
+
             void draw(MTK::View* view);
 
         private:
@@ -36,6 +38,14 @@
             MTL::Buffer* _argBuff;
             MTL::Buffer* _vertexPositionsBuff;
             MTL::Buffer* _vertexColorsBuff;
+            MTL::Buffer* _frameBuff[3];
+
+            float _angle;
+            int _frame;
+
+            dispatch_semaphore_t _semaphore;
+
+            static const int maxFrames;
             
     };
 
@@ -224,11 +234,16 @@ int main() {
 #pragma mark - Render
 #pragma region Render {
 
-    Render::Render(MTL::Device* device) : _device(device -> retain()) {
+    const int Render::maxFrames = 3;
+
+    Render::Render(MTL::Device* device) : _device(device -> retain()), _angle(0.f), _frame(0) {
         _commandQueue = _device -> newCommandQueue();
 
         buildShaders();
         buildBuffers();
+        buildFrame();
+
+        _semaphore = dispatch_semaphore_create(Render::maxFrames);
     }
 
     Render::~Render() {
@@ -236,6 +251,11 @@ int main() {
         _argBuff -> release();
         _vertexPositionsBuff -> release();
         _vertexColorsBuff -> release();
+
+        for (int i = 0; i < Render::maxFrames; i++) {
+            _frameBuff[i] -> release();
+        }
+
         _pipeState -> release();
         _commandQueue -> release();
         _device -> release();
@@ -264,12 +284,22 @@ int main() {
 
             };
 
+            struct FrameData {
+
+                float angle;
+
+            };
+
             v2f vertex vertexCore(uint vertexId [[vertex_id]],
-                device const VertexCoreData* vertexCoreData [[buffer(0)]]) {
+                device const VertexCoreData* vertexCoreData [[buffer(0)]],
+                constant FrameData* frameData [[buffer(1)]]) {
+
+                    float ang = frameData -> angle;
+                    float3x3 rot = float3x3(sin(ang), cos(ang), 0.0, cos(ang), -sin(ang), 0.0, 0.0, 0.0, 1.0);
 
                     v2f out;
 
-                    out.position = float4(vertexCoreData -> positions[vertexId], 1.0);
+                    out.position = float4(rot * vertexCoreData -> positions[vertexId], 1.0);
                     out.color = half3(vertexCoreData -> colors[vertexId]);
 
                     return out;
@@ -366,11 +396,37 @@ int main() {
         argEncoder -> release();
     }
 
+    struct FrameData {
+
+        float angle;
+
+    };
+
+    void Render::buildFrame() {
+        for (int i = 0; i < Render::maxFrames; i++) {
+            _frameBuff[i] = _device -> newBuffer(sizeof(FrameData), MTL::ResourceStorageModeManaged);
+        }
+    }
+
     void Render::draw(MTK::View* view) {
 
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc() -> init();
 
+        _frame = (_frame + 1) % Render::maxFrames;
+
+        MTL::Buffer* fdBuff = _frameBuff[_frame];
         MTL::CommandBuffer* cmdBuff = _commandQueue -> commandBuffer();
+
+        dispatch_semaphore_wait(_semaphore, DISPATCH_TIME_FOREVER);
+        Render* render = this;
+
+        cmdBuff -> addCompletedHandler([render](MTL::CommandBuffer* cmdBuff) {
+            dispatch_semaphore_signal(render -> _semaphore);
+        });
+
+        reinterpret_cast<FrameData*>(fdBuff -> contents()) -> angle = (_angle += 0.01f);
+        fdBuff -> didModifyRange(NS::Range::Make(0, sizeof(FrameData)));
+
         MTL::RenderPassDescriptor* passDesc = view -> currentRenderPassDescriptor();
         MTL::RenderCommandEncoder* cmdEncoder = cmdBuff -> renderCommandEncoder(passDesc);
 
@@ -378,6 +434,7 @@ int main() {
         cmdEncoder -> setVertexBuffer(_argBuff, 0, 0);
         cmdEncoder -> useResource(_vertexPositionsBuff, MTL::ResourceUsageRead);
         cmdEncoder -> useResource(_vertexColorsBuff, MTL::ResourceUsageRead);
+        cmdEncoder -> setVertexBuffer(fdBuff, 0, 1);
         cmdEncoder -> drawPrimitives(MTL::PrimitiveType::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
         cmdEncoder -> endEncoding();
 
