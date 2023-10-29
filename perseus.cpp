@@ -11,6 +11,9 @@
 
 #include <simd/simd.h>
 
+static constexpr size_t instances = 32;
+static constexpr size_t maxFrames = 3;
+
 #pragma region Declaration {
 
     class Render {
@@ -25,8 +28,6 @@
 
             void buildBuffers();
 
-            void buildFrame();
-
             void draw(MTK::View* view);
 
         private:
@@ -35,10 +36,9 @@
             MTL::CommandQueue* _commandQueue;
             MTL::Library* _shaderLibrary;
             MTL::RenderPipelineState* _pipeState;
-            MTL::Buffer* _argBuff;
-            MTL::Buffer* _vertexPositionsBuff;
-            MTL::Buffer* _vertexColorsBuff;
-            MTL::Buffer* _frameBuff[3];
+            MTL::Buffer* _vertexDataBuff;
+            MTL::Buffer* _instanceDataBuff[maxFrames];
+            MTL::Buffer* _indexBuff;
 
             float _angle;
             int _frame;
@@ -241,24 +241,33 @@ int main() {
 
         buildShaders();
         buildBuffers();
-        buildFrame();
 
         _semaphore = dispatch_semaphore_create(Render::maxFrames);
     }
 
     Render::~Render() {
         _shaderLibrary -> release();
-        _argBuff -> release();
-        _vertexPositionsBuff -> release();
-        _vertexColorsBuff -> release();
+        _vertexDataBuff -> release();
 
-        for (int i = 0; i < Render::maxFrames; i++) {
-            _frameBuff[i] -> release();
+        for (int i = 0; i < maxFrames; i++) {
+            _instanceDataBuff[i] -> release();
         }
 
+        _indexBuff -> release();
         _pipeState -> release();
         _commandQueue -> release();
         _device -> release();
+    }
+
+    namespace shader {
+
+        struct InstanceCoreData {
+
+            simd::float4x4 instanceTransform;
+            simd::float4 instanceColor;
+
+        };
+
     }
 
     void Render::buildShaders() {
@@ -279,28 +288,28 @@ int main() {
 
             struct VertexCoreData {
 
-                device float3* positions [[id(0)]];
-                device float3* colors [[id(1)]];
+                float3 position;
 
             };
 
-            struct FrameData {
+            struct InstanceCoreData {
 
-                float angle;
+                float4x4 instanceTransform;
+                float4 instanceColor;
 
             };
 
             v2f vertex vertexCore(uint vertexId [[vertex_id]],
+                uint instanceId [[instance_id]],
                 device const VertexCoreData* vertexCoreData [[buffer(0)]],
-                constant FrameData* frameData [[buffer(1)]]) {
-
-                    float ang = frameData -> angle;
-                    float3x3 rot = float3x3(sin(ang), cos(ang), 0.0, cos(ang), -sin(ang), 0.0, 0.0, 0.0, 1.0);
+                device const InstanceCoreData* instanceCoreData [[buffer(1)]]) {
 
                     v2f out;
 
-                    out.position = float4(rot * vertexCoreData -> positions[vertexId], 1.0);
-                    out.color = half3(vertexCoreData -> colors[vertexId]);
+                    float4 pos = float4(vertexCoreData[vertexId].position, 1.0);
+
+                    out.position = instanceCoreData[instanceId].instanceTransform * pos;
+                    out.color = half3(instanceCoreData[instanceId].instanceColor.rgb);
 
                     return out;
                 }
@@ -346,65 +355,39 @@ int main() {
 
     void Render::buildBuffers() {
 
-        const size_t numVerticles = 3;
+        const float s = 0.5f;
 
-        simd::float3 positions[numVerticles] = {
-            {-0.8f, 0.8f, 0.0f},
-            {0.0f, -0.8f, 0.0f},
-            {+0.8f, 0.8f, 0.0f}
+        simd::float3 verts[] = {
+            {-s, -s, +s},
+            {+s, -s, +s},
+            {+s, +s, +s},
+            {-s, +s, +s}
         };
 
-        simd::float3 colors[numVerticles] = {
-            {1.0f, 0.3f, 0.2f},
-            {0.8f, 1.0, 0.0f},
-            {0.8f, 0.0f, 1.0}
+        uint16_t indices[] = {
+            0, 1, 2,
+            2, 3, 0,
         };
 
-        const size_t positionsSize = numVerticles * sizeof(simd::float3);
-        const size_t colorsSize = numVerticles * sizeof(simd::float3);
+        const size_t vertexDataSize = sizeof(verts);
+        const size_t indexDataSize = sizeof(indices);
 
-        MTL::Buffer* vPosBuff = _device -> newBuffer(positionsSize, MTL::ResourceStorageModeManaged);
-        MTL::Buffer* vColBuff = _device -> newBuffer(colorsSize, MTL::ResourceStorageModeManaged);
+        MTL::Buffer* vertBuff = _device -> newBuffer(vertexDataSize, MTL::ResourceStorageModeManaged);
+        MTL::Buffer* indBuff = _device -> newBuffer(indexDataSize, MTL::ResourceStorageModeManaged);
 
-        _vertexPositionsBuff = vPosBuff;
-        _vertexColorsBuff = vColBuff;
+        _vertexDataBuff = vertBuff;
+        _indexBuff = indBuff;
 
-        memcpy(_vertexPositionsBuff -> contents(), positions, positionsSize);
-        memcpy(_vertexColorsBuff -> contents(), colors, colorsSize);
+        memcpy(_vertexDataBuff -> contents(), verts, vertexDataSize);
+        memcpy(_indexBuff -> contents(), indices, indexDataSize);
 
-        _vertexPositionsBuff -> didModifyRange(NS::Range::Make(0, _vertexPositionsBuff -> length()));
-        _vertexColorsBuff -> didModifyRange(NS::Range::Make(0, _vertexColorsBuff -> length()));
+        _vertexDataBuff -> didModifyRange(NS::Range::Make(0, _vertexDataBuff -> length()));
+        _indexBuff -> didModifyRange(NS::Range::Make(0, _indexBuff -> length()));
 
-        using NS::UTF8StringEncoding;
+        const size_t instanceDataSize = maxFrames * instances * sizeof(shader::InstanceCoreData);
 
-        assert(_shaderLibrary);
-
-        MTL::Function* vFn = _shaderLibrary -> newFunction(NS::String::string("vertexCore", UTF8StringEncoding));
-        MTL::ArgumentEncoder* argEncoder = vFn -> newArgumentEncoder(0);
-
-        MTL::Buffer* argBuff = _device -> newBuffer(argEncoder -> encodedLength(), MTL::ResourceStorageModeManaged);
-
-        _argBuff = argBuff;
-
-        argEncoder -> setArgumentBuffer(_argBuff, 0);
-        argEncoder -> setBuffer(_vertexPositionsBuff, 0, 0);
-        argEncoder -> setBuffer(_vertexColorsBuff, 0, 1);
-
-        argBuff -> didModifyRange(NS::Range::Make(0, _argBuff -> length()));
-
-        vFn -> release();
-        argEncoder -> release();
-    }
-
-    struct FrameData {
-
-        float angle;
-
-    };
-
-    void Render::buildFrame() {
-        for (int i = 0; i < Render::maxFrames; i++) {
-            _frameBuff[i] = _device -> newBuffer(sizeof(FrameData), MTL::ResourceStorageModeManaged);
+        for (size_t i = 0; i < maxFrames; i++) {
+            _instanceDataBuff[i] = _device -> newBuffer(instanceDataSize, MTL::ResourceStorageModeManaged);
         }
     }
 
@@ -414,7 +397,7 @@ int main() {
 
         _frame = (_frame + 1) % Render::maxFrames;
 
-        MTL::Buffer* fdBuff = _frameBuff[_frame];
+        MTL::Buffer* insBuff = _instanceDataBuff[_frame];
         MTL::CommandBuffer* cmdBuff = _commandQueue -> commandBuffer();
 
         dispatch_semaphore_wait(_semaphore, DISPATCH_TIME_FOREVER);
@@ -424,18 +407,47 @@ int main() {
             dispatch_semaphore_signal(render -> _semaphore);
         });
 
-        reinterpret_cast<FrameData*>(fdBuff -> contents()) -> angle = (_angle += 0.01f);
-        fdBuff -> didModifyRange(NS::Range::Make(0, sizeof(FrameData)));
+        _angle += 0.01f;
+        const float scl = 0.1f;
+
+        shader::InstanceCoreData* instanceCoreData = reinterpret_cast<shader::InstanceCoreData*>(insBuff -> contents());
+
+        for (size_t i = 0; i < instances; i++) {
+
+            float divInstances = i / (float) instances;
+            float xOff = (divInstances * 2.0f - 1.0f) + (1.f / instances);
+            float yOff = sin((divInstances + _angle) * 2.0f * M_PI);
+
+            instanceCoreData[i].instanceTransform = (simd::float4x4) {
+                (simd::float4) {scl * sinf(_angle), scl * cosf(_angle), 0.f, 0.f},
+                (simd::float4) {scl * cosf(_angle), scl * -sinf(_angle), 0.f, 0.f},
+                (simd::float4) {0.f, 0.f, scl, 0.f},
+                (simd::float4) {xOff, yOff, 0.f, 1.f}
+            };
+
+            float r = divInstances;
+            float g = 1.0f - r;
+            float b = sinf(M_PI * 2.0f * divInstances);
+            
+            instanceCoreData[i].instanceColor = (simd::float4) {r, g, b, 1.0f};
+        }
+        
+        insBuff -> didModifyRange(NS::Range::Make(0, insBuff -> length()));
 
         MTL::RenderPassDescriptor* passDesc = view -> currentRenderPassDescriptor();
         MTL::RenderCommandEncoder* cmdEncoder = cmdBuff -> renderCommandEncoder(passDesc);
 
         cmdEncoder -> setRenderPipelineState(_pipeState);
-        cmdEncoder -> setVertexBuffer(_argBuff, 0, 0);
-        cmdEncoder -> useResource(_vertexPositionsBuff, MTL::ResourceUsageRead);
-        cmdEncoder -> useResource(_vertexColorsBuff, MTL::ResourceUsageRead);
-        cmdEncoder -> setVertexBuffer(fdBuff, 0, 1);
-        cmdEncoder -> drawPrimitives(MTL::PrimitiveType::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+        cmdEncoder -> setVertexBuffer(_vertexDataBuff, 0, 0);
+        cmdEncoder -> setVertexBuffer(insBuff, 0, 1);
+        cmdEncoder -> drawIndexedPrimitives(
+            MTL::PrimitiveType::PrimitiveTypeTriangle,
+            6,
+            MTL::IndexType::IndexTypeUInt16,
+            _indexBuff,
+            0,
+            instances
+        );
         cmdEncoder -> endEncoding();
 
         cmdBuff -> presentDrawable(view -> currentDrawable());
