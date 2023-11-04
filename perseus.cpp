@@ -11,8 +11,12 @@
 
 #include <simd/simd.h>
 
-static constexpr size_t instances = 32;
-static constexpr size_t maxFrames = 3;
+static constexpr size_t INSTANCE_ROWS = 10;
+static constexpr size_t INSTANCE_COLUMNS = 10;
+static constexpr size_t INSTANCE_DEPTH = 10;
+
+static constexpr size_t INSTANCES = (INSTANCE_ROWS * INSTANCE_COLUMNS * INSTANCE_DEPTH);
+static constexpr size_t FRAMES = 3;
 
 #pragma region Declaration {
 
@@ -22,11 +26,18 @@ static constexpr size_t maxFrames = 3;
         constexpr simd_float4x4 identity();
 
         simd::float4x4 perspective();
+
         simd::float4x4 rotateX(float radiansAngle);
+
         simd::float4x4 rotateY(float radiansAngle);
+
         simd::float4x4 rotateZ(float radiansAngle);
+
         simd::float4x4 translate(const simd::float3& vec);
+
         simd::float4x4 scale(const simd::float3& vec);
+
+        simd::float3x3 discard(const simd::float4x4& matr);
 
     }
 
@@ -54,8 +65,8 @@ static constexpr size_t maxFrames = 3;
             MTL::RenderPipelineState* _pipeState;
             MTL::DepthStencilState* _depthStencilState;
             MTL::Buffer* _vertexDataBuff;
-            MTL::Buffer* _instanceDataBuff[maxFrames];
-            MTL::Buffer* _cameraDataBuff[maxFrames];
+            MTL::Buffer* _instanceDataBuff[FRAMES];
+            MTL::Buffer* _cameraDataBuff[FRAMES];
             MTL::Buffer* _indexBuff;
 
             float _angle;
@@ -63,7 +74,7 @@ static constexpr size_t maxFrames = 3;
 
             dispatch_semaphore_t _semaphore;
 
-            static const int maxFrames;
+            static const int FRAMES;
             
     };
 
@@ -213,7 +224,7 @@ int main() {
 
         _view = MTK::View::alloc() -> init(frame, _device);
         _view -> setColorPixelFormat(MTL::PixelFormat::PixelFormatBGRA8Unorm_sRGB);
-        _view -> setClearColor(MTL::ClearColor::Make(0.0, 0.0, 0.0, 0.8));
+        _view -> setClearColor(MTL::ClearColor::Make(0.0, 0.0, 0.0, 1.0));
         _view -> setDepthStencilPixelFormat(MTL::PixelFormat::PixelFormatDepth16Unorm);
         _view -> setClearDepth(1.0f);
 
@@ -331,12 +342,20 @@ int main() {
             );
         }
 
+        simd::float3x3 discard(const simd::float4x4& matr) {
+            return simd_matrix(
+                matr.columns[0].xyz,
+                matr.columns[1].xyz,
+                matr.columns[2].xyz
+            );
+        }
+
     }
 
 #pragma mark - Render
 #pragma region Render {
 
-    const int Render::maxFrames = 3;
+    const int Render::FRAMES = 3;
 
     Render::Render(MTL::Device* device) : _device(device -> retain()), _angle(0.f), _frame(0) {
         _commandQueue = _device -> newCommandQueue();
@@ -345,7 +364,7 @@ int main() {
         buildDepthStencilStates();
         buildBuffers();
 
-        _semaphore = dispatch_semaphore_create(Render::maxFrames);
+        _semaphore = dispatch_semaphore_create(Render::FRAMES);
     }
 
     Render::~Render() {
@@ -353,11 +372,11 @@ int main() {
         _depthStencilState -> release();
         _vertexDataBuff -> release();
 
-        for (int i = 0; i < maxFrames; i++) {
+        for (int i = 0; i < FRAMES; i++) {
             _instanceDataBuff[i] -> release();
         }
 
-        for (int i = 0; i < maxFrames; i++) {
+        for (int i = 0; i < FRAMES; i++) {
             _cameraDataBuff[i] -> release();
         }
 
@@ -369,9 +388,17 @@ int main() {
 
     namespace shader {
 
+        struct VertexData {
+
+            simd::float3 position;
+            simd::float3 normal;
+
+        };
+
         struct InstanceData {
 
             simd::float4x4 instanceTransform;
+            simd::float3x3 instanceNormalTransform;
             simd::float4 instanceColor;
 
         };
@@ -380,6 +407,7 @@ int main() {
 
             simd::float4x4 perspectiveTransform;
             simd::float4x4 worldTransform;
+            simd::float3x3 worldNormalTransform;
 
         };
 
@@ -397,6 +425,7 @@ int main() {
             struct v2f {
 
                 float4 position [[position]];
+                float3 normal;
                 half3 color;
 
             };
@@ -404,12 +433,14 @@ int main() {
             struct VertexData {
 
                 float3 position;
+                float3 normal;
 
             };
 
             struct InstanceData {
 
                 float4x4 instanceTransform;
+                float3x3 instanceNormalTransform;
                 float4 instanceColor;
 
             };
@@ -418,6 +449,7 @@ int main() {
 
                 float4x4 perspectiveTransform;
                 float4x4 worldTransform;
+                float3x3 worldNormalTransform;
 
             };
 
@@ -434,14 +466,25 @@ int main() {
                     pos = instanceData[instanceId].instanceTransform * pos;
                     pos = cameraData.perspectiveTransform * cameraData.worldTransform * pos;
 
+                    float3 norm = instanceData[instanceId].instanceNormalTransform * vertexData[vertexId].normal;
+                    
+                    norm = cameraData.worldNormalTransform * norm;
+
                     out.position = pos;
+                    out.normal = norm;
                     out.color = half3(instanceData[instanceId].instanceColor.rgb);
 
                     return out;
                 }
 
             half4 fragment fragmentCore(v2f in [[stage_in]]) {
-                return half4(in.color, 1.0);
+
+                float3 l = normalize(float3(1.0, 1.0, 0.8));
+                float3 n = normalize(in.normal);
+
+                float ndotl = saturate(dot(n, l));
+
+                return half4(in.color * 0.1 + in.color * ndotl, 1.0);
             }
 
         )";
@@ -498,36 +541,56 @@ int main() {
 
         const float s = 0.5f;
 
-        float3 verts[] = {
-            {-s, -s, +s},
-            {+s, -s, +s},
-            {+s, +s, +s},
-            {-s, +s, +s},
+        shader::VertexData verts[] = {
+            {{-s, -s, +s}, {0.f, 0.f, 1.f}},
+            {{+s, -s, +s}, {0.f, 0.f, 1.f}},
+            {{+s, +s, +s}, {0.f, 0.f, 1.f}},
+            {{-s, +s, +s}, {0.f, 0.f, 1.f}},
 
-            {-s, -s, -s},
-            {-s, +s, -s},
-            {+s, +s, -s},
-            {+s, -s, -s}
+            {{+s, -s, +s}, {1.f, 0.f, 0.f}},
+            {{+s, -s, -s}, {1.f, 0.f, 0.f}},
+            {{+s, +s, -s}, {1.f, 0.f, 0.f}},
+            {{+s, +s, +s}, {1.f, 0.f, 0.f}},
+
+            {{+s, -s, -s}, {0.f, 0.f, -1.f}},
+            {{-s, -s, -s}, {0.f, 0.f, -1.f}},
+            {{-s, +s, -s}, {0.f, 0.f, -1.f}},
+            {{+s, +s, -s}, {0.f, 0.f, -1.f}},
+
+            {{-s, -s, -s}, {-1.f, 0.f, 0.f}},
+            {{-s, -s, +s}, {-1.f, 0.f, 0.f}},
+            {{-s, +s, +s}, {-1.f, 0.f, 0.f}},
+            {{-s, +s, -s}, {-1.f, 0.f, 0.f}},
+
+            {{-s, +s, +s}, {0.f, 1.f, 0.f}},
+            {{+s, +s, +s}, {0.f, 1.f, 0.f}},
+            {{+s, +s, -s}, {0.f, 1.f, 0.f}},
+            {{-s, +s, -s}, {0.f, 1.f, 0.f}},
+
+            {{-s, -s, -s}, {0.f, -1.f, 0.f}},
+            {{+s, -s, -s}, {0.f, -1.f, 0.f}},
+            {{+s, -s, +s}, {0.f, -1.f, 0.f}},
+            {{-s, -s, +s}, {0.f, -1.f, 0.f}}
         };
 
         uint16_t indices[] = {
             0, 1, 2,
             2, 3, 0,
 
-            1, 7, 6,
-            6, 2, 1,
+            4, 5, 6,
+            6, 7, 4,
 
-            7, 4, 5,
-            5, 6, 7,
+            8, 9, 10,
+            10, 11, 8,
 
-            4, 0, 3,
-            3, 5, 4,
+            12, 13, 14,
+            14, 15, 12,
 
-            3, 2, 6,
-            6, 5, 3,
+            16, 17, 18,
+            18, 19, 16,
 
-            4, 7, 1,
-            1, 0, 4
+            20, 21, 22,
+            22, 23, 20
         };
 
         const size_t vertexDataSize = sizeof(verts);
@@ -545,15 +608,15 @@ int main() {
         _vertexDataBuff -> didModifyRange(NS::Range::Make(0, _vertexDataBuff -> length()));
         _indexBuff -> didModifyRange(NS::Range::Make(0, _indexBuff -> length()));
 
-        const size_t instanceDataSize = maxFrames * instances * sizeof(shader::InstanceData);
+        const size_t instanceDataSize = FRAMES * INSTANCES * sizeof(shader::InstanceData);
 
-        for (size_t i = 0; i < maxFrames; i++) {
+        for (size_t i = 0; i < FRAMES; i++) {
             _instanceDataBuff[i] = _device -> newBuffer(instanceDataSize, MTL::ResourceStorageModeManaged);
         }
 
-        const size_t cameraDataSize = maxFrames * sizeof(shader::CameraData);
+        const size_t cameraDataSize = FRAMES * sizeof(shader::CameraData);
 
-        for (size_t i = 0; i < maxFrames; i++) {
+        for (size_t i = 0; i < FRAMES; i++) {
             _cameraDataBuff[i] = _device -> newBuffer(cameraDataSize, MTL::ResourceStorageModeManaged);
         }
     }
@@ -562,7 +625,7 @@ int main() {
 
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc() -> init();
 
-        _frame = (_frame + 1) % Render::maxFrames;
+        _frame = (_frame + 1) % Render::FRAMES;
 
         MTL::Buffer* insBuff = _instanceDataBuff[_frame];
         MTL::CommandBuffer* cmdBuff = _commandQueue -> commandBuffer();
@@ -574,38 +637,62 @@ int main() {
             dispatch_semaphore_signal(render -> _semaphore);
         });
 
-        _angle += 0.01f;
-        const float scl = 0.1f;
+        _angle += 0.002f;
+        const float scl = 0.2f;
 
         shader::InstanceData* insData = reinterpret_cast<shader::InstanceData*>(insBuff -> contents());
 
-        simd::float3 objectPos = {0.f, 0.f, -5.f};
+        simd::float3 objectPos = {0.f, 0.f, -10.f};
 
         simd::float4x4 trans = math::translate(objectPos);
-        simd::float4x4 rot = math::rotateY(-_angle);
+        simd::float4x4 rotY = math::rotateY(-_angle);
+        simd::float4x4 rotX = math::rotateX(_angle * 0.5);
         simd::float4x4 inverTrans = math::translate({
             -objectPos.x, -objectPos.y, -objectPos.z
         });
-        simd::float4x4 fullRot = trans * rot * inverTrans;
+        simd::float4x4 fullRot = trans * rotY * rotX * inverTrans;
 
-        for (size_t i = 0; i < instances; i++) {
+        size_t xI = 0;
+        size_t yI = 0;
+        size_t zI = 0;
 
-            float divInstances = i / (float) instances;
-            float xOff = (divInstances * 2.0f - 1.0f) + (1.f / instances);
-            float yOff = sin((divInstances + _angle) * 2.0f * M_PI);
+        for (size_t i = 0; i < INSTANCES; i++) {
+
+            if (xI == INSTANCE_ROWS) {
+
+                xI = 0;
+                yI += 1;
+
+            }
+
+            if (yI == INSTANCE_ROWS) {
+
+                yI = 0;
+                zI += 1;
+
+            }
 
             simd::float4x4 scale = math::scale((simd::float3) {scl, scl, scl});
-            simd::float4x4 rotZ = math::rotateZ(_angle);
-            simd::float4x4 rotY = math::rotateY(_angle);
-            simd::float4x4 translate = math::translate(math::add(objectPos, {xOff, yOff, 0.f}));
+            simd::float4x4 rotZ = math::rotateZ(_angle * sinf((float) xI));
+            simd::float4x4 rotY = math::rotateY(_angle * cosf((float) yI));
+
+            float x = ((float) xI - (float) INSTANCE_ROWS / 2.f) * (2.f * scl) + scl;
+            float y = ((float) yI - (float) INSTANCE_COLUMNS / 2.f) * (2.f * scl) + scl;
+            float z = ((float) zI - (float) INSTANCE_DEPTH / 2.f) * (2.f * scl);
+
+            simd::float4x4 translate = math::translate(math::add(objectPos, {x, y, z}));
 
             insData[i].instanceTransform = fullRot * translate * rotY * rotZ * scale;
+            insData[i].instanceNormalTransform = math::discard(insData[i].instanceTransform);
 
-            float r = divInstances;
+            float divIns = i / (float) INSTANCES;
+            float r = divIns;
             float g = 1.0f - r;
-            float b = sinf(M_PI * 2.0f * divInstances);
+            float b = sinf(M_PI * 2.0f * divIns);
             
             insData[i].instanceColor = (simd::float4) {r, g, b, 1.0f};
+
+            xI += 1;
         }
         
         insBuff -> didModifyRange(NS::Range::Make(0, insBuff -> length()));
@@ -616,6 +703,7 @@ int main() {
 
         cameraData -> perspectiveTransform = math::perspective(45.f * M_PI / 180.f, 1.f, 0.03f, 500.0f);
         cameraData -> worldTransform = math::identity();
+        cameraData -> worldNormalTransform = math::discard(cameraData -> worldTransform);
         
         camBuff -> didModifyRange(NS::Range::Make(0, sizeof(shader::CameraData)));
 
@@ -635,7 +723,7 @@ int main() {
             MTL::IndexType::IndexTypeUInt16,
             _indexBuff,
             0,
-            instances
+            INSTANCES
         );
         cmdEncoder -> endEncoding();
 
