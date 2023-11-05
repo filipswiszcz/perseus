@@ -53,6 +53,8 @@ static constexpr size_t FRAMES = 3;
 
             void buildDepthStencilStates();
 
+            void buildTextures();
+
             void buildBuffers();
 
             void draw(MTK::View* view);
@@ -64,6 +66,7 @@ static constexpr size_t FRAMES = 3;
             MTL::Library* _shaderLibrary;
             MTL::RenderPipelineState* _pipeState;
             MTL::DepthStencilState* _depthStencilState;
+            MTL::Texture* _texture;
             MTL::Buffer* _vertexDataBuff;
             MTL::Buffer* _instanceDataBuff[FRAMES];
             MTL::Buffer* _cameraDataBuff[FRAMES];
@@ -362,12 +365,14 @@ int main() {
 
         buildShaders();
         buildDepthStencilStates();
+        buildTextures();
         buildBuffers();
 
         _semaphore = dispatch_semaphore_create(Render::FRAMES);
     }
 
     Render::~Render() {
+        _texture -> release();
         _shaderLibrary -> release();
         _depthStencilState -> release();
         _vertexDataBuff -> release();
@@ -392,6 +397,7 @@ int main() {
 
             simd::float3 position;
             simd::float3 normal;
+            simd::float2 coord;
 
         };
 
@@ -426,6 +432,7 @@ int main() {
 
                 float4 position [[position]];
                 float3 normal;
+                float2 coord;
                 half3 color;
 
             };
@@ -434,6 +441,7 @@ int main() {
 
                 float3 position;
                 float3 normal;
+                float2 coord;
 
             };
 
@@ -472,19 +480,26 @@ int main() {
 
                     out.position = pos;
                     out.normal = norm;
+                    out.coord = vertexData[vertexId].coord.xy;
                     out.color = half3(instanceData[instanceId].instanceColor.rgb);
 
                     return out;
                 }
 
-            half4 fragment fragmentCore(v2f in [[stage_in]]) {
+            half4 fragment fragmentCore(v2f in [[stage_in]], texture2d<half, access::sample> tex [[texture(0)]]) {
+
+                constexpr sampler samp(address::repeat, filter::linear);
+
+                half3 texSamp = tex.sample(samp, in.coord).rgb;
 
                 float3 l = normalize(float3(1.0, 1.0, 0.8));
                 float3 n = normalize(in.normal);
 
                 float ndotl = saturate(dot(n, l));
 
-                return half4(in.color * 0.1 + in.color * ndotl, 1.0);
+                half3 illum = (in.color * texSamp * 0.1) + (in.color * texSamp * ndotl);
+
+                return half4(illum, 1.0);
             }
 
         )";
@@ -535,42 +550,81 @@ int main() {
         desc -> release();
     }
 
-    void Render::buildBuffers() {
+    void Render::buildTextures() {
 
-        using simd::float3;
+        const uint32_t width = 128;
+        const uint32_t height = 128;
+
+        MTL::TextureDescriptor* textureDesc = MTL::TextureDescriptor::alloc() -> init();
+
+        textureDesc -> setWidth(width);
+        textureDesc -> setHeight(height);
+        textureDesc -> setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+        textureDesc -> setTextureType(MTL::TextureType2D);
+        textureDesc -> setStorageMode(MTL::StorageModeManaged);
+        textureDesc -> setUsage(MTL::ResourceUsageSample | MTL::ResourceUsageRead);
+
+        MTL::Texture *texture = _device -> newTexture(textureDesc);
+
+        _texture = texture;
+
+        uint8_t* textureData = (u_int8_t*) alloca(width * height * 4);
+
+        for (size_t y = 0; y < height; y++) {
+            for (size_t x = 0; x < width; x++) {
+
+                bool white = (x ^ y) & 0b1000000;
+
+                uint8_t col = white ? 0xFF : 0xA;
+
+                size_t i = y * width + x;
+
+                textureData[i * 4 + 0] = col;
+                textureData[i * 4 + 1] = col;
+                textureData[i * 4 + 2] = col;
+                textureData[i * 4 + 3] = 0xFF;
+            }
+        }
+
+        _texture -> replaceRegion(MTL::Region(0, 0, 0, width, height, 1), 0, textureData, width * 4);
+
+        textureDesc -> release();
+    }
+
+    void Render::buildBuffers() {
 
         const float s = 0.5f;
 
         shader::VertexData verts[] = {
-            {{-s, -s, +s}, {0.f, 0.f, 1.f}},
-            {{+s, -s, +s}, {0.f, 0.f, 1.f}},
-            {{+s, +s, +s}, {0.f, 0.f, 1.f}},
-            {{-s, +s, +s}, {0.f, 0.f, 1.f}},
+            {{-s, -s, +s}, {0.f, 0.f, 1.f}, {0.f, 1.f}},
+            {{+s, -s, +s}, {0.f, 0.f, 1.f}, {1.f, 1.f}},
+            {{+s, +s, +s}, {0.f, 0.f, 1.f}, {1.f, 0.f}},
+            {{-s, +s, +s}, {0.f, 0.f, 1.f}, {0.f, 0.f}},
 
-            {{+s, -s, +s}, {1.f, 0.f, 0.f}},
-            {{+s, -s, -s}, {1.f, 0.f, 0.f}},
-            {{+s, +s, -s}, {1.f, 0.f, 0.f}},
-            {{+s, +s, +s}, {1.f, 0.f, 0.f}},
+            {{+s, -s, +s}, {1.f, 0.f, 0.f}, {0.f, 1.f}},
+            {{+s, -s, -s}, {1.f, 0.f, 0.f}, {1.f, 1.f}},
+            {{+s, +s, -s}, {1.f, 0.f, 0.f}, {1.f, 0.f}},
+            {{+s, +s, +s}, {1.f, 0.f, 0.f}, {0.f, 0.f}},
 
-            {{+s, -s, -s}, {0.f, 0.f, -1.f}},
-            {{-s, -s, -s}, {0.f, 0.f, -1.f}},
-            {{-s, +s, -s}, {0.f, 0.f, -1.f}},
-            {{+s, +s, -s}, {0.f, 0.f, -1.f}},
+            {{+s, -s, -s}, {0.f, 0.f, -1.f}, {0.f, 1.f}},
+            {{-s, -s, -s}, {0.f, 0.f, -1.f}, {1.f, 1.f}},
+            {{-s, +s, -s}, {0.f, 0.f, -1.f}, {1.f, 0.f}},
+            {{+s, +s, -s}, {0.f, 0.f, -1.f}, {0.f, 0.f}},
 
-            {{-s, -s, -s}, {-1.f, 0.f, 0.f}},
-            {{-s, -s, +s}, {-1.f, 0.f, 0.f}},
-            {{-s, +s, +s}, {-1.f, 0.f, 0.f}},
-            {{-s, +s, -s}, {-1.f, 0.f, 0.f}},
+            {{-s, -s, -s}, {-1.f, 0.f, 0.f}, {0.f, 1.f}},
+            {{-s, -s, +s}, {-1.f, 0.f, 0.f}, {1.f, 1.f}},
+            {{-s, +s, +s}, {-1.f, 0.f, 0.f}, {1.f, 0.f}},
+            {{-s, +s, -s}, {-1.f, 0.f, 0.f}, {0.f, 0.f}},
 
-            {{-s, +s, +s}, {0.f, 1.f, 0.f}},
-            {{+s, +s, +s}, {0.f, 1.f, 0.f}},
-            {{+s, +s, -s}, {0.f, 1.f, 0.f}},
-            {{-s, +s, -s}, {0.f, 1.f, 0.f}},
+            {{-s, +s, +s}, {0.f, 1.f, 0.f}, {0.f, 1.f}},
+            {{+s, +s, +s}, {0.f, 1.f, 0.f}, {1.f, 1.f}},
+            {{+s, +s, -s}, {0.f, 1.f, 0.f}, {1.f, 0.f}},
+            {{-s, +s, -s}, {0.f, 1.f, 0.f}, {0.f, 0.f}},
 
-            {{-s, -s, -s}, {0.f, -1.f, 0.f}},
-            {{+s, -s, -s}, {0.f, -1.f, 0.f}},
-            {{+s, -s, +s}, {0.f, -1.f, 0.f}},
-            {{-s, -s, +s}, {0.f, -1.f, 0.f}}
+            {{-s, -s, -s}, {0.f, -1.f, 0.f}, {0.f, 1.f}},
+            {{+s, -s, -s}, {0.f, -1.f, 0.f}, {1.f, 1.f}},
+            {{+s, -s, +s}, {0.f, -1.f, 0.f}, {1.f, 0.f}},
+            {{-s, -s, +s}, {0.f, -1.f, 0.f}, {0.f, 0.f}}
         };
 
         uint16_t indices[] = {
@@ -715,6 +769,7 @@ int main() {
         cmdEncoder -> setVertexBuffer(_vertexDataBuff, 0, 0);
         cmdEncoder -> setVertexBuffer(insBuff, 0, 1);
         cmdEncoder -> setVertexBuffer(camBuff, 0, 2);
+        cmdEncoder -> setFragmentTexture(_texture, 0);
         cmdEncoder -> setCullMode(MTL::CullModeBack);
         cmdEncoder -> setFrontFacingWinding(MTL::Winding::WindingCounterClockwise);
         cmdEncoder -> drawIndexedPrimitives(
