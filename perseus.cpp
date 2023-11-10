@@ -18,6 +18,9 @@ static constexpr size_t INSTANCE_DEPTH = 10;
 static constexpr size_t INSTANCES = (INSTANCE_ROWS * INSTANCE_COLUMNS * INSTANCE_DEPTH);
 static constexpr size_t FRAMES = 3;
 
+static constexpr uint32_t TEXTURE_WIDTH = 128;
+static constexpr uint32_t TEXTURE_HEIGHT = 128;
+
 #pragma region Declaration {
 
     namespace math {
@@ -51,11 +54,15 @@ static constexpr size_t FRAMES = 3;
 
             void buildShaders();
 
+            void buildComputePipeline();
+
             void buildDepthStencilStates();
 
             void buildTextures();
 
             void buildBuffers();
+
+            void buildMandelbrotTexture();
 
             void draw(MTK::View* view);
 
@@ -64,7 +71,8 @@ static constexpr size_t FRAMES = 3;
             MTL::Device* _device;
             MTL::CommandQueue* _commandQueue;
             MTL::Library* _shaderLibrary;
-            MTL::RenderPipelineState* _pipeState;
+            MTL::RenderPipelineState* _renPipeState;
+            MTL::ComputePipelineState* _comPipeState;
             MTL::DepthStencilState* _depthStencilState;
             MTL::Texture* _texture;
             MTL::Buffer* _vertexDataBuff;
@@ -364,9 +372,11 @@ int main() {
         _commandQueue = _device -> newCommandQueue();
 
         buildShaders();
+        buildComputePipeline();
         buildDepthStencilStates();
         buildTextures();
         buildBuffers();
+        buildMandelbrotTexture();
 
         _semaphore = dispatch_semaphore_create(Render::FRAMES);
     }
@@ -386,7 +396,8 @@ int main() {
         }
 
         _indexBuff -> release();
-        _pipeState -> release();
+        _comPipeState -> release();
+        _renPipeState -> release();
         _commandQueue -> release();
         _device -> release();
     }
@@ -522,9 +533,9 @@ int main() {
         desc -> colorAttachments() -> object(0) -> setPixelFormat(MTL::PixelFormat::PixelFormatBGRA8Unorm_sRGB);
         desc -> setDepthAttachmentPixelFormat(MTL::PixelFormat::PixelFormatDepth16Unorm);
 
-        _pipeState = _device -> newRenderPipelineState(desc, &err);
+        _renPipeState = _device -> newRenderPipelineState(desc, &err);
 
-        if (!_pipeState) {
+        if (!_renPipeState) {
             __builtin_printf("%s", err -> localizedDescription() -> utf8String());
             assert(false);
         }
@@ -536,6 +547,64 @@ int main() {
         
         _shaderLibrary = lib;
 
+    }
+
+    void Render::buildComputePipeline() {
+
+        const char* src = R"(
+            #include <metal_stdlib>
+
+            using namespace metal;
+
+            kernel void mandelbrotSet(uint2 id [[thread_position_in_grid]],
+                uint2 grid [[threads_per_grid]],
+                texture2d<half, access::write> tex [[texture(0)]]) {
+
+                    float sclX = 2.0 * id.x / grid.x - 1.5;
+                    float sclY = 2.0 * id.y / grid.y - 1.0;
+
+                    float tempX = 0.0;
+                    float x = 0.0;
+                    float y = 0.0;
+
+                    uint iter = 0;
+                    uint maxIter = 1000;
+
+                    while (x * x + y * y <= 4 && iter < maxIter) {
+
+                        tempX = x * x - y * y + sclX;
+
+                        y = 2 * x * y + sclY;
+                        x = tempX;
+
+                        iter += 1;
+                    }
+
+                    half color = (0.5 + 0.5 * cos(3.0 + iter * 0.15));
+
+                    tex.write(half4(color, color, color, 1.0), id, 0);
+                }
+        )";
+
+        NS::Error* err = nullptr;
+        MTL::Library* lib = _device -> newLibrary(NS::String::string(src, NS::UTF8StringEncoding), nullptr, &err);
+
+        if (!lib) {
+            __builtin_printf("%s", err -> localizedDescription() -> utf8String());
+            assert(false);
+        }
+
+        MTL::Function* mFn = lib -> newFunction(NS::String::string("mandelbrotSet", NS::UTF8StringEncoding));
+
+        _comPipeState = _device -> newComputePipelineState(mFn, &err);
+
+        if (!_comPipeState) {
+            __builtin_printf("%s", err -> localizedDescription() -> utf8String());
+            assert(false);
+        }
+
+        mFn -> release();
+        lib -> release();
     }
 
     void Render::buildDepthStencilStates() {
@@ -552,13 +621,10 @@ int main() {
 
     void Render::buildTextures() {
 
-        const uint32_t width = 128;
-        const uint32_t height = 128;
-
         MTL::TextureDescriptor* textureDesc = MTL::TextureDescriptor::alloc() -> init();
 
-        textureDesc -> setWidth(width);
-        textureDesc -> setHeight(height);
+        textureDesc -> setWidth(TEXTURE_WIDTH);
+        textureDesc -> setHeight(TEXTURE_HEIGHT);
         textureDesc -> setPixelFormat(MTL::PixelFormatRGBA8Unorm);
         textureDesc -> setTextureType(MTL::TextureType2D);
         textureDesc -> setStorageMode(MTL::StorageModeManaged);
@@ -567,26 +633,6 @@ int main() {
         MTL::Texture *texture = _device -> newTexture(textureDesc);
 
         _texture = texture;
-
-        uint8_t* textureData = (u_int8_t*) alloca(width * height * 4);
-
-        for (size_t y = 0; y < height; y++) {
-            for (size_t x = 0; x < width; x++) {
-
-                bool white = (x ^ y) & 0b1000000;
-
-                uint8_t col = white ? 0xFF : 0xA;
-
-                size_t i = y * width + x;
-
-                textureData[i * 4 + 0] = col;
-                textureData[i * 4 + 1] = col;
-                textureData[i * 4 + 2] = col;
-                textureData[i * 4 + 3] = 0xFF;
-            }
-        }
-
-        _texture -> replaceRegion(MTL::Region(0, 0, 0, width, height, 1), 0, textureData, width * 4);
 
         textureDesc -> release();
     }
@@ -673,6 +719,28 @@ int main() {
         for (size_t i = 0; i < FRAMES; i++) {
             _cameraDataBuff[i] = _device -> newBuffer(cameraDataSize, MTL::ResourceStorageModeManaged);
         }
+    }
+
+    void Render::buildMandelbrotTexture() {
+
+        MTL::CommandBuffer* cmdBuff = _commandQueue -> commandBuffer();
+        assert(cmdBuff);
+
+        MTL::ComputeCommandEncoder* comEncoder = cmdBuff -> computeCommandEncoder();
+
+        comEncoder -> setComputePipelineState(_comPipeState);
+        comEncoder -> setTexture(_texture, 0);
+
+        MTL::Size gridSize = MTL::Size(TEXTURE_WIDTH, TEXTURE_HEIGHT, 1);
+
+        NS::UInteger threadsSize = _comPipeState -> maxTotalThreadsPerThreadgroup();
+
+        MTL::Size threadGrSize(threadsSize, 1, 1);
+
+        comEncoder -> dispatchThreads(gridSize, threadGrSize);
+        comEncoder -> endEncoding();
+
+        cmdBuff -> commit();
     }
 
     void Render::draw(MTK::View* view) {
@@ -764,7 +832,7 @@ int main() {
         MTL::RenderPassDescriptor* passDesc = view -> currentRenderPassDescriptor();
         MTL::RenderCommandEncoder* cmdEncoder = cmdBuff -> renderCommandEncoder(passDesc);
 
-        cmdEncoder -> setRenderPipelineState(_pipeState);
+        cmdEncoder -> setRenderPipelineState(_renPipeState);
         cmdEncoder -> setDepthStencilState(_depthStencilState);
         cmdEncoder -> setVertexBuffer(_vertexDataBuff, 0, 0);
         cmdEncoder -> setVertexBuffer(insBuff, 0, 1);
